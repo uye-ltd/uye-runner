@@ -269,6 +269,7 @@ Generate new token (classic).
 | Scope | Why |
 |---|---|
 | `manage_runners:org` | Register / deregister org-level runners |
+| `admin:org` | Required alongside `manage_runners:org` for the API to accept the token |
 | `read:packages` | Pull the runner image from GHCR (if the package is private) |
 
 The `GITHUB_TOKEN` used in the deploy workflow (built-in) only needs

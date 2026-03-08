@@ -20,7 +20,7 @@ The runner container has the Docker CLI but no daemon. Every `docker build` / `d
 ## Prerequisites
 
 - Docker + Docker Compose v2 on the host
-- A GitHub **classic** PAT with `manage_runners:org` and `read:packages` scopes
+- A GitHub **classic** PAT with `admin:org`, `manage_runners:org`, and `read:packages` scopes
   (fine-grained tokens do not support `manage_runners:org`)
 - The GitHub org slug you want to attach the runner to
 
@@ -55,7 +55,7 @@ Copy `.env.example` to `.env` and fill in:
 
 | Variable | Required | Description |
 |---|---|---|
-| `GITHUB_TOKEN` | yes | Classic PAT with `manage_runners:org` + `read:packages` scopes |
+| `GITHUB_TOKEN` | yes | Classic PAT with `admin:org`, `manage_runners:org`, and `read:packages` scopes |
 | `GITHUB_ORG` | yes | GitHub org slug (e.g. `acme`) |
 | `RUNNER_NAME` | no | Display name — defaults to container hostname |
 | `RUNNER_LABELS` | no | Comma-separated labels, default `self-hosted,linux,x64` |
