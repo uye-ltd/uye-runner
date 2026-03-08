@@ -1,5 +1,5 @@
 services:
-  dind:
+  docker:
     image: docker:27-dind
     privileged: true
     environment:
