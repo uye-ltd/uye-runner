@@ -34,6 +34,9 @@ RUN curl -fsSL \
       | tar -xz \
     && chown -R runner:runner /home/runner/actions-runner
 
+# Install runner .NET dependencies
+RUN sudo ./bin/installdependencies.sh
+
 COPY entrypoint.sh /home/runner/actions-runner/entrypoint.sh
 RUN chmod +x /home/runner/actions-runner/entrypoint.sh
 
