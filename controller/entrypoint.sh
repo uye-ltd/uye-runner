@@ -56,7 +56,7 @@ cleanup_all_managed() {
   docker ps -a \
     --filter "label=runner-managed=true" \
     --filter "label=runner-role=runner" \
-    --format '{{index .Labels "runner-job-id"}}' \
+    --format '{{.Label "runner-job-id"}}' \
     | while read -r job_id; do
         [[ -n "${job_id}" ]] && cleanup_job "${job_id}" &
       done
@@ -74,7 +74,7 @@ cleanup_exited_runners() {
     --filter "label=runner-managed=true" \
     --filter "label=runner-role=runner" \
     --filter "status=exited" \
-    --format '{{index .Labels "runner-job-id"}}' \
+    --format '{{.Label "runner-job-id"}}' \
     | while read -r job_id; do
         [[ -z "${job_id}" ]] && continue
         local exit_code
