@@ -1,6 +1,6 @@
 # uye-runner
 
-Self-hosted GitHub Actions runner in Docker, with a Docker-in-Docker sidecar for building and pushing container images. Registers at the organization level, deregisters cleanly on shutdown, and redeploys itself automatically on every push to `main`.
+Hardened self-hosted GitHub Actions runner for public repositories. Each job runs in a fresh, isolated container that is destroyed on completion. A GitOps deployer polls GHCR for new images, verifies their cosign signatures, and applies updates without SSH.
 
 ---
 
@@ -8,12 +8,37 @@ Self-hosted GitHub Actions runner in Docker, with a Docker-in-Docker sidecar for
 
 ```
 docker-compose
-├── dind   docker:27-dind (privileged)   isolated Docker daemon + TLS
-└── runner  this image                   GH Actions runner binary
-            DOCKER_HOST=tcp://dind:2376  delegates all docker commands to dind
+├── controller-proxy   Docker API filter (no EXEC, no BUILD)
+├── controller         pool manager → controller-proxy → Docker socket
+├── deployer-proxy     Docker API filter (no EXEC, no BUILD)
+└── deployer           GitOps pull loop → deployer-proxy → Docker socket
+                       + ./:/workspace:ro,  :HEALTH_PORT/health
+
+Per job (created and destroyed by the controller):
+├── runner-net-{id}    isolated bridge network (10.89.x.x, egress-restricted)
+└── runner-job-{id}    ephemeral runner (Kaniko binary for image builds)
 ```
 
-The runner container has the Docker CLI but no daemon. Every `docker build` / `docker push` in a workflow is forwarded over TLS to the `dind` sidecar. This keeps the host Docker socket out of reach.
+**Controller** maintains a warm pool of idle runners (`DESIRED_IDLE`, default 2). When a runner picks up a job it exits. The controller tears down all per-job resources and spawns a replacement.
+
+**Runner containers** have no Docker socket and no privileged flag. Image builds use [Kaniko](https://github.com/GoogleContainerTools/kaniko), which builds from a Dockerfile in userspace without a daemon. `GITHUB_TOKEN` never enters a runner — only a short-lived registration token is injected at spawn time.
+
+---
+
+## Security properties
+
+| Threat | Protection |
+|---|---|
+| Malicious job leaves persistent state | Container destroyed after every job (`--ephemeral`) |
+| Privileged container escape | No privileged flag — Kaniko builds in userspace, no DinD |
+| PAT theft | `GITHUB_TOKEN` stays in the controller; runners get only a short-lived registration token |
+| Docker socket abuse | Socket proxy allows only required API endpoints; `EXEC` and `BUILD` disabled on both proxies |
+| Supply chain / image tampering | cosign keyless signing in CI; deployer verifies signature before every pull |
+| Resource abuse (mining, DoS) | `--memory` and `--cpus` limits on every runner container |
+| Network exfiltration / lateral movement | Egress policy: DNS + HTTPS only; private RFC 1918 ranges blocked |
+| Kernel-level container escape | `seccomp/runner-profile.json` blocks `mount`, `kexec_*`, `bpf`, kernel module syscalls |
+| File system / capability abuse | AppArmor profile denies `sys_admin`, `sys_module`, `net_raw`, sysfs writes, host credential reads |
+| Stranger PRs triggering jobs | GitHub setting: require approval for outside collaborators (see below) |
 
 ---
 
@@ -22,102 +47,198 @@ The runner container has the Docker CLI but no daemon. Every `docker build` / `d
 - Docker + Docker Compose v2 on the host
 - A GitHub **classic** PAT with `admin:org`, `manage_runners:org`, and `read:packages` scopes
   (fine-grained tokens do not support `manage_runners:org`)
-- The GitHub org slug you want to attach the runner to
+- The GitHub org slug you want to attach runners to
 
 ---
 
-## Quick start
+## One-time server setup
+
+Run as root before starting the stack for the first time.
 
 ```bash
-# 1. Clone
-git clone https://github.com/YOUR_ORG/uye-runner ~/uye-runner
-cd ~/uye-runner
+# Network egress policy — restricts runner containers to DNS + HTTPS only,
+# blocks private networks, configures Docker address pool for job networks
+sudo bash ~/uye-runner/scripts/setup-egress-policy.sh
+sudo systemctl restart docker   # required for address pool change to take effect
 
-# 2. Configure
-cp .env.example .env
-$EDITOR .env   # set GITHUB_TOKEN and GITHUB_ORG
-
-# 3. Start
-docker compose up --build -d
-
-# 4. Verify
-docker compose logs -f runner
-# → "Runner registered. Starting..."
+# AppArmor profile — MAC layer restricting runner capabilities and file access
+sudo bash ~/uye-runner/scripts/setup-apparmor.sh
+# Verify: aa-status | grep uye-runner
 ```
 
-Then go to `https://github.com/organizations/YOUR_ORG/settings/actions/runners` — the runner should appear as **Idle**.
+The egress script allocates job networks from `10.89.0.0/16` and adds iptables
+`DOCKER-USER` rules restricting that subnet to DNS and HTTPS only.
+
+The AppArmor script installs `apparmor/uye-runner` and loads it. The controller passes
+`--security-opt apparmor=uye-runner` to every runner container.
+
+The controller and deployer services each have their own isolated network in
+`172.20.0.0/24` and are not subject to the runner egress rules.
+
+---
+
+## First-time server setup
+
+```bash
+# 1. Create a dedicated user
+sudo useradd -m -s /bin/bash ghrunner
+sudo usermod -aG docker ghrunner
+
+# 2. Authenticate with GHCR (as ghrunner)
+sudo -iu ghrunner
+echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+
+# 3. Clone and configure
+git clone https://github.com/YOUR_ORG/uye-runner ~/uye-runner
+cd ~/uye-runner
+cp .env.example .env
+$EDITOR .env   # required: GITHUB_TOKEN, GITHUB_ORG, COMPOSE_PROJECT_NAME
+               # recommended: RUNNER_SECCOMP_HOST_PATH
+
+# 4. Pull and start (pulls all four services from GHCR)
+docker compose pull
+docker compose up -d
+
+# 5. Verify
+docker compose logs -f controller | jq .
+# → {"level":"info","svc":"controller","msg":"Runner is live","job_id":"..."}
+```
+
+After the initial start the deployer takes over — every push to `main` rebuilds
+images, signs them, and the deployer verifies and applies updates automatically.
+
+### Required GitHub setting
+
+**Settings → Actions → General → Fork pull request workflows →
+"Require approval for all outside collaborators"**
+
+This prevents PR workflows from unknown contributors from queuing at all.
 
 ---
 
 ## Environment variables
 
-Copy `.env.example` to `.env` and fill in:
+Copy `.env.example` to `.env`:
 
-| Variable | Required | Description |
-|---|---|---|
-| `GITHUB_TOKEN` | yes | Classic PAT with `admin:org`, `manage_runners:org`, and `read:packages` scopes |
-| `GITHUB_ORG` | yes | GitHub org slug (e.g. `acme`) |
-| `RUNNER_NAME` | no | Display name — defaults to container hostname |
-| `RUNNER_LABELS` | no | Comma-separated labels, default `self-hosted,linux,x64` |
-
-The Docker connection variables (`DOCKER_HOST`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`) are set automatically by Compose and should not be added to `.env`.
-
----
-
-## Auto-deploy
-
-Every push to `main` triggers `.github/workflows/deploy.yml`, which:
-
-1. Builds the runner image and pushes it to GHCR (`ghcr.io/{org}/uye-runner`)
-2. SSHes into the server and runs `docker compose pull runner && docker compose up -d runner`
-
-The `dind` service is never restarted during redeploy, so the Docker layer cache and TLS certs persist.
-
-### Required GitHub Actions secrets
-
-Add these in **Settings → Secrets → Actions**:
-
-| Secret | Value |
-|---|---|
-| `DEPLOY_HOST` | Server IP or hostname |
-| `DEPLOY_USER` | `ghrunner` (dedicated deploy user) |
-| `DEPLOY_SSH_KEY` | Private key PEM generated on the server (see server setup below) |
-
-### Server setup
-
-Run once on the server to create a dedicated user and configure SSH:
-
-```bash
-# As your main user
-sudo useradd -m -s /bin/bash ghrunner
-sudo usermod -aG docker ghrunner
-
-# As ghrunner
-sudo -iu ghrunner
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-ssh-keygen -t ed25519 -C deploy -f ~/.ssh/uye_runner_deploy  # no passphrase
-cat ~/.ssh/uye_runner_deploy.pub >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-
-# Paste the private key into the DEPLOY_SSH_KEY GitHub secret
-cat ~/.ssh/uye_runner_deploy
-
-# Authenticate with GHCR (persists in ~/.docker/config.json)
-echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
-```
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GITHUB_TOKEN` | yes | — | Classic PAT: `admin:org`, `manage_runners:org`, `read:packages` |
+| `GITHUB_ORG` | yes | — | GitHub org slug (e.g. `acme`) |
+| `GITHUB_REPO` | no | `uye-runner` | Repo name; used to construct the cosign certificate identity |
+| `RUNNER_LABELS` | no | `self-hosted,linux,x64` | Comma-separated runner labels |
+| `DESIRED_IDLE` | no | `2` | Warm idle runners to keep ready |
+| `RUNNER_MEMORY` | no | `4g` | Memory limit per runner container |
+| `RUNNER_CPUS` | no | `2` | CPU limit per runner container |
+| `RUNNER_KANIKO_SIZE` | no | `5g` | tmpfs size for Kaniko scratch space inside runner |
+| `RUNNER_APPARMOR_PROFILE` | no | `uye-runner` | AppArmor profile name; empty to disable |
+| `RUNNER_SECCOMP_HOST_PATH` | no | — | Absolute host path to `seccomp/runner-profile.json` |
+| `COMPOSE_PROJECT_NAME` | yes | `uye-runner` | Must match the directory name on the server |
+| `POLL_INTERVAL` | no | `60` | Seconds between GHCR digest checks |
+| `HEALTH_PORT` | no | `8080` | Port for the deployer health endpoint |
 
 ---
 
 ## Using the runner in a workflow
 
+There is no Docker daemon in the runner. Use `kaniko` for building and pushing images.
+`docker login` (credential storage only) still works for setting up registry auth.
+
 ```yaml
 jobs:
   build:
-    runs-on: self-hosted   # or a custom label set in RUNNER_LABELS
+    runs-on: self-hosted   # or a custom label from RUNNER_LABELS
+    permissions:
+      contents: read     # minimum — declare only what this workflow needs
+      packages: write    # push to GHCR
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t myimage .
-      - run: docker push myimage
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        run: |
+          kaniko \
+            --context=$GITHUB_WORKSPACE \
+            --dockerfile=Dockerfile \
+            --destination=ghcr.io/${{ github.repository_owner }}/myapp:latest \
+            --destination=ghcr.io/${{ github.repository_owner }}/myapp:${{ github.sha }} \
+            --cleanup
+```
+
+`docker/login-action` writes credentials to `~/.docker/config.json`. Kaniko reads from
+there automatically. No `--registry-*` flags needed.
+
+`--cleanup` removes extracted image layers after the build, keeping disk usage low.
+Kaniko's scratch space is limited to `RUNNER_KANIKO_SIZE` (default `5g`) via tmpfs.
+If you enable layer caching (`--cache`), add `--cache-ttl=1h` to prevent unbounded growth.
+
+### Prevent fork PRs from running with secrets
+
+```yaml
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    # Run on push to main, or on internal PRs only (not fork PRs)
+    if: >
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+```
+
+### Scope `GITHUB_TOKEN` in every workflow
+
+GitHub injects a `GITHUB_TOKEN` automatically with broad default permissions. Declare
+only what each workflow needs and set the org-level default to read-only:
+
+**Settings → Actions → General → Workflow permissions → Read repository contents and packages permissions**
+
+---
+
+## GitOps deploy flow
+
+```
+push to main
+  → CI builds runner / controller / deployer images
+  → CI pushes to GHCR with :latest and :sha tags
+  → CI signs each image with cosign (keyless, OIDC-anchored to this workflow)
+  → deployer detects new digest
+      → new deployer image?   → verify sig → self-update → exit
+      → new controller image? → verify sig → docker compose up -d controller
+      → always               → verify runner sig → pre-pull for fast spawns
+```
+
+A signature verification failure immediately sets `GET /health` to `503` and skips
+the update — the currently running (verified) image stays in place.
+
+---
+
+## Health monitoring
+
+```
+GET http://<server>:HEALTH_PORT/health
+```
+
+| Response | Meaning |
+|---|---|
+| `200 {"status":"ok","ts":"..."}` | Last cycle completed cleanly |
+| `503 {"status":"unhealthy","reason":"...","ts":"..."}` | Signature verification failed or `docker compose up` errored |
+
+Point UptimeRobot, Grafana Synthetic Monitoring, or any HTTP monitor at this endpoint.
+
+Both services emit **newline-delimited JSON logs**:
+
+```bash
+docker compose logs -f controller | jq .
+docker compose logs -f deployer   | jq .
 ```
 
 ---
@@ -125,29 +246,50 @@ jobs:
 ## Common operations
 
 ```bash
-# Tail logs
-docker compose logs -f runner
-docker compose logs -f dind        # for docker build failures
+# Follow logs
+docker compose logs -f controller | jq .
+docker compose logs -f deployer   | jq .
 
-# Restart runner only (dind keeps running)
-docker compose restart runner
+# Check health
+curl -s http://localhost:8080/health | jq .
 
-# Graceful shutdown — runner deregisters from GitHub
+# List all live per-job containers
+docker ps --filter label=runner-managed=true
+
+# Force respawn all runners (e.g. after changing .env pool settings)
+docker compose restart controller
+
+# Full teardown (in-progress jobs are interrupted)
 docker compose down
 
-# Rebuild locally after Dockerfile changes
-docker compose build runner && docker compose up -d runner
+# Local build after code changes
+docker compose build
+docker compose up -d
 ```
 
 ---
 
 ## Updating the runner binary
 
-Bump `RUNNER_VERSION` in `Dockerfile`, then push to `main` — CI handles the rest. Or rebuild locally:
+Bump `RUNNER_VERSION` in `Dockerfile` and push to `main`. CI rebuilds all three images,
+signs them, and the deployer verifies and applies the update.
 
-```bash
-docker compose build --build-arg RUNNER_VERSION=2.324.0 runner
-docker compose up -d runner
+```dockerfile
+ARG RUNNER_VERSION=2.324.0   # ← bump here
 ```
 
 Latest releases: https://github.com/actions/runner/releases
+
+---
+
+## GitHub PAT scopes
+
+Use a **classic token** — fine-grained tokens do not support `manage_runners:org`.
+
+Create at: **github.com/settings/tokens → Tokens (classic)**
+
+| Scope | Why |
+|---|---|
+| `manage_runners:org` | Register/deregister org-level runners |
+| `admin:org` | Required alongside `manage_runners:org` |
+| `read:packages` | Pull runner image from GHCR (if package is private) |

@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # Runner image (Dockerfile) + socket proxy image (docker-compose.yml)
+  # Dependabot's Docker ecosystem scans both Dockerfiles and docker-compose.yml
+  # in the target directory, so this single entry covers the root Dockerfile
+  # (runner) and the tecnativa/docker-socket-proxy version in docker-compose.yml.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Controller image
+  - package-ecosystem: docker
+    directory: /controller
+    schedule:
+      interval: weekly
+
+  # Deployer image (Dockerfile + cosign ARG version)
+  - package-ecosystem: docker
+    directory: /deployer
+    schedule:
+      interval: weekly
+
+  # GitHub Actions versions in the CI workflow
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

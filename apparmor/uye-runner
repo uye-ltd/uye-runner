@@ -1,0 +1,105 @@
+#include <tunables/global>
+
+# AppArmor profile for uye-runner ephemeral job containers.
+#
+# Strategy: deny-by-exception. Broad filesystem access is granted so arbitrary
+# CI workflow steps can function, but targeted denials cover host-impacting
+# capabilities, kernel tunables, driver paths, and sensitive credential files.
+# AppArmor deny rules take precedence over allow rules regardless of order.
+#
+# Load with: scripts/setup-apparmor.sh
+# Applied by the controller via: --security-opt apparmor=uye-runner
+
+profile uye-runner flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+
+  # ---------------------------------------------------------------------------
+  # Capabilities
+  # Allow what a root CI process legitimately needs for building and pushing
+  # images. Deny capabilities that affect the host beyond this container.
+  # ---------------------------------------------------------------------------
+
+  capability chown,
+  capability dac_override,
+  capability dac_read_search,
+  capability fowner,
+  capability fsetid,
+  capability kill,
+  capability net_bind_service,
+  capability setgid,
+  capability setuid,
+  capability sys_chroot,
+  capability audit_write,
+
+  deny capability mac_admin,
+  deny capability mac_override,
+  deny capability net_admin,
+  deny capability net_raw,
+  deny capability sys_admin,
+  deny capability sys_boot,
+  deny capability sys_module,
+  deny capability sys_ptrace,
+  deny capability sys_rawio,
+  deny capability sys_time,
+  deny capability syslog,
+  deny capability wake_alarm,
+
+  # ---------------------------------------------------------------------------
+  # Network
+  # Allow TCP/UDP for git clone, Kaniko registry push, and API calls.
+  # Deny raw and packet sockets (used for crafting packets, ARP spoofing, etc.)
+  # ---------------------------------------------------------------------------
+
+  network inet  tcp,
+  network inet  udp,
+  network inet6 tcp,
+  network inet6 udp,
+  network netlink raw,   # required by several system tools for interface queries
+
+  deny network raw,
+  deny network packet,
+
+  # ---------------------------------------------------------------------------
+  # Filesystem
+  # Broad access for CI, with explicit denials for sensitive host paths.
+  # ---------------------------------------------------------------------------
+
+  # Allow everything by default — workflows need to read/write/exec broadly
+  /** rwlkm,
+
+  # --- Kernel tunables and trigger files ---
+  deny /proc/sysrq-trigger        w,
+  deny /proc/sys/kernel/core_pattern w,
+  deny /proc/sys/kernel/modprobe  w,
+  deny /proc/sys/kernel/hotplug   w,
+  deny /proc/sys/vm/drop_caches   w,
+  deny /proc/sys/fs/binfmt_misc/** w,
+
+  # --- Sysfs: kernel, driver, firmware, cgroup manipulation ---
+  deny /sys/kernel/**    w,
+  deny /sys/firmware/**  rw,
+  deny /sys/fs/cgroup/** w,
+  deny /sys/bus/**       w,
+  deny /sys/devices/**   w,
+
+  # --- Host credentials and privilege escalation paths ---
+  deny /etc/shadow        r,
+  deny /etc/shadow-       r,
+  deny /etc/gshadow       r,
+  deny /etc/gshadow-      r,
+  deny /etc/sudoers       r,
+  deny /etc/sudoers.d/**  r,
+
+  # --- Cron (prevent persistence across the ephemeral container lifetime) ---
+  deny /etc/crontab       w,
+  deny /etc/cron.d/**     w,
+  deny /etc/cron.daily/** w,
+  deny /var/spool/cron/** w,
+
+  # --- Kernel module loading ---
+  deny /sbin/modprobe x,
+  deny /sbin/insmod   x,
+  deny /sbin/rmmod    x,
+  deny /lib/modules/** w,
+}

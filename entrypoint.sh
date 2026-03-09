@@ -1,39 +1,23 @@
 #!/bin/bash
 set -euo pipefail
 
-GITHUB_TOKEN="${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
 GITHUB_ORG="${GITHUB_ORG:?GITHUB_ORG is required}"
 RUNNER_NAME="${RUNNER_NAME:-$(hostname)}"
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,x64}"
 
-# Obtain a short-lived registration token
-REG_TOKEN=$(curl -fsSL \
-  -X POST \
-  -H "Authorization: token ${GITHUB_TOKEN}" \
-  -H "Accept: application/vnd.github+json" \
-  "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/registration-token" \
-  | jq -r '.token')
+# Registration token must be pre-fetched and injected by the controller.
+# The token is short-lived (~1h) and is fetched immediately before container start.
+REG_TOKEN="${RUNNER_REGISTRATION_TOKEN:?RUNNER_REGISTRATION_TOKEN is required — must be injected by the controller}"
 
-if [[ -z "${REG_TOKEN}" || "${REG_TOKEN}" == "null" ]]; then
-  echo "ERROR: Failed to obtain registration token. Check GITHUB_TOKEN and GITHUB_ORG." >&2
-  exit 1
-fi
-
-# Configure the runner
+# Configure in ephemeral mode: the runner auto-deregisters after exactly one job.
+# No cleanup trap needed — --ephemeral handles deregistration automatically.
 ./config.sh \
   --url "https://github.com/${GITHUB_ORG}" \
   --token "${REG_TOKEN}" \
   --name "${RUNNER_NAME}" \
   --labels "${RUNNER_LABELS}" \
   --unattended \
-  --replace
+  --ephemeral
 
-# Deregister on shutdown
-cleanup() {
-  echo "Deregistering runner..."
-  ./config.sh remove --unattended --token "${REG_TOKEN}" || true
-}
-trap cleanup SIGTERM SIGINT
-
-echo "Runner registered. Starting..."
+echo "Runner registered (ephemeral). Starting..."
 exec ./run.sh

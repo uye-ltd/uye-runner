@@ -1,28 +1,109 @@
 services:
-  docker:
-    image: docker:27-dind
-    privileged: true
-    environment:
-      DOCKER_TLS_CERTDIR: /certs
-    volumes:
-      - dind-certs:/certs
-      - dind-storage:/var/lib/docker
-    restart: unless-stopped
 
-  runner:
-    image: ghcr.io/${GITHUB_ORG}/uye-runner:latest
-    build: .  # used locally; CI publishes the image to GHCR
+  # ---------------------------------------------------------------------------
+  # Socket proxies
+  # Each proxy sits between its service and /var/run/docker.sock, allowing
+  # only the Docker API endpoints that service actually needs. The service
+  # containers no longer mount the socket directly.
+  #
+  # EXEC and BUILD are disabled on both proxies — these are the primary
+  # escape vectors if a service container is compromised.
+  # ---------------------------------------------------------------------------
+
+  controller-proxy:
+    image: tecnativa/docker-socket-proxy:0.7.0
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1   # spawn, inspect, list, remove runner containers
+      NETWORKS:   1   # create and remove per-job bridge networks
+      IMAGES:     1   # docker pull runner image
+      POST:       1   # allow write operations
+      DELETE:     1   # allow delete operations
+      INFO:       1   # docker info (used by compose internals)
+      # All others (EXEC, BUILD, PLUGINS, SYSTEM, SWARM, SECRETS) default to 0
+    networks:
+      - controller-proxy-net
+
+  deployer-proxy:
+    image: tecnativa/docker-socket-proxy:0.7.0
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1   # docker compose up recreates the controller container
+      NETWORKS:   1   # docker compose manages compose networks
+      IMAGES:     1   # docker pull for digest checks
+      VOLUMES:    1   # docker compose inspects volumes
+      POST:       1
+      DELETE:     1
+      INFO:       1
+      # EXEC, BUILD, PLUGINS, SYSTEM, SWARM, SECRETS default to 0
+    networks:
+      - deployer-proxy-net
+
+  # ---------------------------------------------------------------------------
+  # Controller — manages the ephemeral runner pool
+  # ---------------------------------------------------------------------------
+
+  controller:
+    image: ghcr.io/${GITHUB_ORG}/uye-runner-controller:latest
+    build:
+      context: ./controller
+    restart: unless-stopped
     depends_on:
-      - docker
+      - controller-proxy
     env_file: .env
     environment:
-      DOCKER_HOST: tcp://docker:2376
-      DOCKER_TLS_VERIFY: "1"
-      DOCKER_CERT_PATH: /certs/client
-    volumes:
-      - dind-certs:/certs:ro
-    restart: unless-stopped
+      RUNNER_IMAGE: ghcr.io/${GITHUB_ORG}/uye-runner:latest
+      DOCKER_HOST: tcp://controller-proxy:2375
+    networks:
+      - controller-proxy-net
+      - controller-net
 
-volumes:
-  dind-certs:
-  dind-storage:
+  # ---------------------------------------------------------------------------
+  # Deployer — GitOps pull loop + health endpoint
+  # ---------------------------------------------------------------------------
+
+  deployer:
+    image: ghcr.io/${GITHUB_ORG}/uye-deployer:latest
+    build:
+      context: ./deployer
+    restart: unless-stopped
+    depends_on:
+      - deployer-proxy
+    env_file: .env
+    environment:
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-uye-runner}
+      HEALTH_PORT: ${HEALTH_PORT:-8080}
+      DOCKER_HOST: tcp://deployer-proxy:2375
+    ports:
+      - "${HEALTH_PORT:-8080}:${HEALTH_PORT:-8080}"
+    volumes:
+      - ./:/workspace:ro   # deployer reads compose file + .env to apply updates
+    networks:
+      - deployer-proxy-net
+      - deployer-net
+
+# No persistent volumes. All per-job volumes are managed by the controller.
+
+networks:
+  # Service↔proxy pairs share a /26 network. No service can reach another
+  # service's proxy. Job networks live in 10.89.0.0/16 (see setup-egress-policy.sh).
+  controller-proxy-net:
+    ipam:
+      config:
+        - subnet: 172.20.0.0/26
+  controller-net:
+    ipam:
+      config:
+        - subnet: 172.20.0.64/26
+  deployer-proxy-net:
+    ipam:
+      config:
+        - subnet: 172.20.128.0/26
+  deployer-net:
+    ipam:
+      config:
+        - subnet: 172.20.128.64/26

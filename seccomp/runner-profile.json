@@ -1,0 +1,31 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_X86",
+    "SCMP_ARCH_X32"
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "mount",
+        "umount2",
+        "pivot_root",
+        "kexec_load",
+        "kexec_file_load",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "iopl",
+        "ioperm",
+        "perf_event_open",
+        "add_key",
+        "request_key",
+        "keyctl",
+        "bpf"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "comment": "Block kernel-level syscalls that could be used for container escape or host compromise. The runner connects to DinD over TLS and does not need any of these."
+    }
+  ]
+}

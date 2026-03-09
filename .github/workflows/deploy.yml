@@ -1,45 +1,89 @@
-name: Build & Deploy Runner
+name: Build & Publish Images
 
+# Triggered on every push to main.
+# Images are pushed to GHCR; the on-server deployer polls for new digests
+# and applies updates automatically — no SSH or push-based deploy here.
 on:
   push:
     branches: [main]
 
+  # Prevent fork PRs from running this workflow.
+  # NOTE: also enable "Require approval for all outside collaborators" in
+  # Settings → Actions → General to stop stranger PRs from queuing at all.
+  pull_request:
+    branches: [main]
+
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/uye-runner
+  REGISTRY: ghcr.io
+  RUNNER_IMAGE:     ghcr.io/${{ github.repository_owner }}/uye-runner
+  CONTROLLER_IMAGE: ghcr.io/${{ github.repository_owner }}/uye-runner-controller
+  DEPLOYER_IMAGE:   ghcr.io/${{ github.repository_owner }}/uye-deployer
 
 jobs:
-  deploy:
+  build:
+    # Only push images on merges to main, not on PR builds from forks.
+    # Fork PRs get no secrets and cannot push to GHCR.
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write  # required for keyless cosign signing via OIDC
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install cosign
+        if: github.event_name == 'push'
+        uses: sigstore/cosign-installer@v3
+
       - name: Log in to GHCR
+        # Skip login on fork PRs — they have no secret access
+        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push runner image
+        id: build-runner
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          push: ${{ github.event_name == 'push' }}
           tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.RUNNER_IMAGE }}:latest
+            ${{ env.RUNNER_IMAGE }}:${{ github.sha }}
 
-      - name: Deploy to server
-        uses: appleboy/ssh-action@v1
+      - name: Build and push controller image
+        id: build-controller
+        uses: docker/build-push-action@v6
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            cd ~/uye-runner
-            docker compose pull runner
-            docker compose up -d runner
+          context: ./controller
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.CONTROLLER_IMAGE }}:latest
+            ${{ env.CONTROLLER_IMAGE }}:${{ github.sha }}
+
+      - name: Build and push deployer image
+        id: build-deployer
+        uses: docker/build-push-action@v6
+        with:
+          context: ./deployer
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.DEPLOYER_IMAGE }}:latest
+            ${{ env.DEPLOYER_IMAGE }}:${{ github.sha }}
+
+      # Sign each image by digest (immutable) not tag (mutable).
+      # Keyless signing: the signature is tied to this workflow's OIDC identity
+      # so only CI running on main can produce a valid signature.
+      - name: Sign images
+        if: github.event_name == 'push'
+        run: |
+          cosign sign --yes \
+            ${{ env.RUNNER_IMAGE }}@${{ steps.build-runner.outputs.digest }}
+          cosign sign --yes \
+            ${{ env.CONTROLLER_IMAGE }}@${{ steps.build-controller.outputs.digest }}
+          cosign sign --yes \
+            ${{ env.DEPLOYER_IMAGE }}@${{ steps.build-deployer.outputs.digest }}

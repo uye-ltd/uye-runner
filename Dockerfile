@@ -2,13 +2,12 @@ FROM ubuntu:22.04
 
 ARG RUNNER_VERSION=2.323.0
 
-# Install system dependencies and Docker CLI (no daemon)
+# System dependencies + Docker CLI (for `docker login` — no daemon needed for credential storage)
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl \
       git \
       jq \
       ca-certificates \
-      sudo \
       gnupg \
       lsb-release \
     && install -m 0755 -d /etc/apt/keyrings \
@@ -22,24 +21,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root runner user
-RUN useradd -m -s /bin/bash runner \
-    && echo "runner ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+# Kaniko executor — builds Docker images from a Dockerfile without a daemon
+# and without a privileged container. Kaniko requires root inside the container
+# but the container itself is unprivileged.
+COPY --from=gcr.io/kaniko-project/executor:latest /kaniko/executor /usr/local/bin/kaniko
 
-WORKDIR /home/runner/actions-runner
+WORKDIR /opt/actions-runner
 
 # Download and extract GitHub Actions runner binary
 RUN curl -fsSL \
       "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
-      | tar -xz \
-    && chown -R runner:runner /home/runner/actions-runner
+      | tar -xz
 
 # Install runner .NET dependencies
-RUN sudo ./bin/installdependencies.sh
+RUN ./bin/installdependencies.sh
 
-COPY entrypoint.sh /home/runner/actions-runner/entrypoint.sh
-RUN chmod +x /home/runner/actions-runner/entrypoint.sh
+COPY entrypoint.sh /opt/actions-runner/entrypoint.sh
+RUN chmod +x /opt/actions-runner/entrypoint.sh
 
-USER runner
-
-ENTRYPOINT ["/home/runner/actions-runner/entrypoint.sh"]
+# Runs as root — required by Kaniko for layer extraction and RUN instruction execution.
+# Container-level isolation (seccomp, resource limits, no Docker socket, ephemeral)
+# is the security boundary, not the in-container user.
+ENTRYPOINT ["/opt/actions-runner/entrypoint.sh"]

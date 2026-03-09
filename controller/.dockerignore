@@ -1,0 +1,3 @@
+# Only entrypoint.sh is needed in the controller image
+*
+!entrypoint.sh
