@@ -30,7 +30,7 @@ jobs:
       id-token: write  # required for keyless cosign signing via OIDC
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install cosign
         if: github.event_name == 'push'
